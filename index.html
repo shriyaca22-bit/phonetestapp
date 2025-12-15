@@ -4,45 +4,57 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="theme-color" content="#111111" />
-
-  <title>Route Sketch Runner 2</title>
+  <title>Route Sketch Runner</title>
 
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="apple-touch-icon" href="icon-192.png" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
 
-  <!-- Leaflet -->
-  <link
-    rel="stylesheet"
-    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-  />
-
   <link rel="stylesheet" href="styles.css" />
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 </head>
 <body>
 <header>
   <h1>Route Sketch Runner</h1>
-  <p class="sub">Run a shape, not just a distance</p>
+  <p class="sub">Explain your run with a drawing: heart, square, or “hi”.</p>
 </header>
 
 <main>
   <section class="card">
     <h2>Choose shape</h2>
     <div class="pillRow" id="shapes">
-      <button class="pill selected" data-shape="square">Square</button>
+      <button class="pill" data-shape="square">Square</button>
       <button class="pill" data-shape="heart">Heart</button>
-      <button class="pill" data-shape="hi">“hi”</button>
+      <button class="pill selected" data-shape="hi">“hi”</button>
     </div>
 
     <div class="grid">
       <label>
         Miles
-        <input id="miles" type="number" step="0.25" min="0.5" value="3" />
+        <input id="miles" type="number" min="0.75" step="0.25" value="3" />
       </label>
+
+      <label>
+        Search effort
+        <select id="effort">
+          <option value="lite">Lite (fastest)</option>
+          <option value="normal" selected>Normal</option>
+          <option value="max">Max (slower)</option>
+        </select>
+      </label>
+
       <button id="build">Build route</button>
     </div>
 
     <p id="status" class="hint"></p>
+    <div class="legend">
+      <span class="dot orange"></span> Ideal shape
+      <span class="dot green"></span> Shape strokes
+      <span class="dot gray"></span> Connectors
+      <span class="dot blue"></span> Full route
+    </div>
   </section>
 
   <section class="card">
