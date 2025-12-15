@@ -1,15 +1,11 @@
 {
-  "name": "Steps Demo",
-  "short_name": "Steps",
-  "start_url": ".",
-  "display": "standalone",
-  "background_color": "#0b0b0c",
-  "theme_color": "#111111",
-  "icons": [
-    {
-      "src": "icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png"
-    }
+  "name":"Route Sketch Runner",
+  "short_name":"RouteRun",
+  "start_url":".",
+  "display":"standalone",
+  "background_color":"#0b0b0c",
+  "theme_color":"#111111",
+  "icons":[
+    {"src":"icon-192.png","sizes":"192x192","type":"image/png"}
   ]
 }
