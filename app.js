@@ -1,28 +1,36 @@
+// Route Sketch Runner — FAST version
+// - Leaflet map
+// - Overpass (1 call) to detect dominant street bearing
+// - OSRM /route with via anchors to force strokes
+// - small search over (center shift × 2 rotations) for best fit
+//
+// Notes:
+// - OSRM public demo is rate-limited; keep effort modest.
+// - Overpass can be slow sometimes, but it's one call.
+
 const $ = (id) => document.getElementById(id);
 
 let selectedShape = "hi";
 let map;
+
+// Layers
 let idealLayer, shapeLayer, connectorLayer, fullLayer;
 
-const OSRM = "https://router.project-osrm.org";
+const OSRM = "https://router.project-osrm.org/route/v1/foot";
 
-// -------------------- helpers --------------------
-const milesToMeters = (mi) => mi * 1609.34;
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
+// ---------- UI helpers ----------
 function setStatus(msg) { $("status").textContent = msg; }
-
-async function getLocation() {
-  return new Promise((resolve, reject) => {
-    navigator.geolocation.getCurrentPosition(
-      (p) => resolve([p.coords.latitude, p.coords.longitude]),
-      reject,
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
-    );
-  });
+function clearSteps() { $("steps").innerHTML = ""; }
+function addStep(text) {
+  const d = document.createElement("div");
+  d.className = "step";
+  d.textContent = text;
+  $("steps").appendChild(d);
 }
 
-// meters east/north -> [lat,lng] at a given center
+// ---------- geo helpers ----------
+const milesToMeters = (mi) => mi * 1609.344;
+
 function offsetToLatLng(centerLat, centerLng, xE, yN) {
   const metersPerDegLat = 111320;
   const metersPerDegLng = 111320 * Math.cos((centerLat * Math.PI) / 180);
@@ -32,13 +40,29 @@ function offsetToLatLng(centerLat, centerLng, xE, yN) {
   ];
 }
 
-// shift center by meters (east, north)
-function shiftCenter([lat,lng], xE, yN) {
-  return offsetToLatLng(lat, lng, xE, yN);
+async function getLocation() {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve([p.coords.latitude, p.coords.longitude]),
+      (e) => reject(e),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
+    );
+  });
 }
 
-function rotatePts(pts, ang) {
-  const c = Math.cos(ang), s = Math.sin(ang);
+// Approx bearing (degrees) from [lat,lng] to [lat,lng]
+function bearingDeg(a, b) {
+  const [lat1, lon1] = a.map(x => x * Math.PI/180);
+  const [lat2, lon2] = b.map(x => x * Math.PI/180);
+  const y = Math.sin(lon2-lon1) * Math.cos(lat2);
+  const x = Math.cos(lat1)*Math.sin(lat2) - Math.sin(lat1)*Math.cos(lat2)*Math.cos(lon2-lon1);
+  const brng = Math.atan2(y, x) * 180/Math.PI;
+  return (brng + 360) % 360;
+}
+
+// ---------- geometry in meters-space ----------
+function rotatePts(pts, angleRad) {
+  const c = Math.cos(angleRad), s = Math.sin(angleRad);
   return pts.map(([x,y]) => [x*c - y*s, x*s + y*c]);
 }
 
@@ -58,7 +82,7 @@ function scaleStrokes(strokes, targetMeters) {
   return strokes.map(st => st.map(([x,y]) => [x*k, y*k]));
 }
 
-// resample polyline in meter space to N points
+// resample meters-polyline into N evenly spaced points
 function resample(pts, N) {
   if (pts.length < 2) return pts;
   const total = polyLen(pts);
@@ -92,7 +116,7 @@ function resample(pts, N) {
   return out;
 }
 
-// distance point->segment in lat/lng space (approx; good enough for scoring)
+// distance point->segment (in lat/lng degrees; for *relative scoring* only)
 function pointToSegmentDist(p, a, b) {
   const px=p[0], py=p[1], ax=a[0], ay=a[1], bx=b[0], by=b[1];
   const vx=bx-ax, vy=by-ay;
@@ -118,10 +142,12 @@ function meanDistance(idealPts, snappedPts) {
   return sum / idealPts.length;
 }
 
-// -------------- shape strokes --------------
+// ---------- shape strokes (meters-space, normalized) ----------
 function getStrokes(shape) {
   if (shape === "square") {
-    return [[[-0.6,-0.6],[0.6,-0.6],[0.6,0.6],[-0.6,0.6],[-0.6,-0.6]]];
+    return [[
+      [-0.6,-0.6],[0.6,-0.6],[0.6,0.6],[-0.6,0.6],[-0.6,-0.6]
+    ]];
   }
   if (shape === "heart") {
     const pts = [];
@@ -135,37 +161,102 @@ function getStrokes(shape) {
     pts.push(pts[0]);
     return [pts];
   }
-  // "hi"
+  // "hi" = strokes: h, i stem, dot
   const h = [[-1.4,-0.8],[-1.4,0.9],[-1.4,0.1],[-0.8,0.1],[-0.8,0.9],[-0.8,-0.8]];
   const iStem = [[0.5,-0.8],[0.5,0.9]];
   const dot = [[0.45,1.15],[0.55,1.15],[0.55,1.05],[0.45,1.05],[0.45,1.15]];
   return [h, iStem, dot];
 }
 
-// -------------- OSRM calls --------------
-// Match snaps a whole trace to roads. That’s the key.
-async function osrmMatchFoot(latlngs) {
+// ---------- OSRM routing ----------
+async function osrmRoute(latlngs) {
+  // latlngs: [[lat,lng], ...] 2+ points
   const coords = latlngs.map(([lat,lng]) => `${lng},${lat}`).join(";");
-  const url = `${OSRM}/match/v1/foot/${coords}?geometries=geojson&overview=full&steps=true`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if (!res.ok || data.code !== "Ok") throw new Error(data.message || "OSRM match failed");
-  const m = data.matchings?.[0];
-  if (!m?.geometry) throw new Error("No matching geometry");
-  return m;
-}
+  const url = `${OSRM}/${coords}?overview=full&steps=true&geometries=geojson&continue_straight=true`;
 
-async function osrmRouteFoot(a, b) {
-  const coords = `${a[1]},${a[0]};${b[1]},${b[0]}`;
-  const url = `${OSRM}/route/v1/foot/${coords}?geometries=geojson&overview=full&steps=true`;
   const res = await fetch(url);
   const data = await res.json();
-  if (!res.ok || data.code !== "Ok") throw new Error(data.message || "OSRM route failed");
+  if (!res.ok || data.code !== "Ok") {
+    throw new Error(data.message || "OSRM route failed");
+  }
   return data.routes[0];
 }
 
-function geoToLatLngs(geo) {
-  return geo.coordinates.map(([lng,lat]) => [lat,lng]);
+function geoToLatLngs(geojsonLine) {
+  return geojsonLine.coordinates.map(([lng,lat]) => [lat,lng]);
+}
+
+// ---------- Overpass: detect dominant local bearing ----------
+async function getDominantBearing(origin, radiusM = 900) {
+  // Query ways (highways) around origin. One request.
+  const [lat, lng] = origin;
+
+  const query = `
+[out:json][timeout:25];
+(
+  way(around:${radiusM},${lat},${lng})["highway"];
+);
+out geom;
+  `.trim();
+
+  const res = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    body: "data=" + encodeURIComponent(query)
+  });
+
+  if (!res.ok) throw new Error("Overpass failed");
+
+  const data = await res.json();
+  const bins = new Array(18).fill(0); // 10° bins, but for grid we fold 180°
+  let totalSegs = 0;
+
+  for (const el of data.elements || []) {
+    if (!el.geometry || el.geometry.length < 2) continue;
+    const g = el.geometry;
+    for (let i=1;i<g.length;i++) {
+      const a = [g[i-1].lat, g[i-1].lon];
+      const b = [g[i].lat, g[i].lon];
+      let br = bearingDeg(a, b);
+      // fold to [0,180)
+      if (br >= 180) br -= 180;
+      const bin = Math.max(0, Math.min(17, Math.floor(br / 10)));
+      bins[bin] += 1;
+      totalSegs++;
+    }
+  }
+
+  if (totalSegs < 50) {
+    // not enough info; fallback to 0°
+    return 0;
+  }
+
+  // pick top bin; then refine by averaging nearby bins
+  let bestBin = 0;
+  for (let i=1;i<bins.length;i++) if (bins[i] > bins[bestBin]) bestBin = i;
+
+  const centerDeg = bestBin * 10 + 5;
+  return centerDeg;
+}
+
+// ---------- scoring + candidate search ----------
+function candidateCenters(origin, effort) {
+  // small spiral of centers around user.
+  // Normal: 9 centers. Max: 13. Lite: 5.
+  const step = effort === "lite" ? 220 : effort === "max" ? 260 : 240;
+
+  const deltas = [
+    [0,0],
+    [ step,0], [-step,0], [0, step], [0,-step],
+    [ step, step], [ step,-step], [-step, step], [-step,-step],
+    [2*step,0], [0,2*step], [-2*step,0], [0,-2*step]
+  ];
+
+  const count = effort === "lite" ? 5 : effort === "max" ? 13 : 9;
+  return deltas.slice(0, count).map(([xE,yN]) => ({
+    center: offsetToLatLng(origin[0], origin[1], xE, yN),
+    xE, yN
+  }));
 }
 
 function clearLayers() {
@@ -173,104 +264,92 @@ function clearLayers() {
   idealLayer = shapeLayer = connectorLayer = fullLayer = null;
 }
 
-// -------------- candidate search --------------
-function candidateCenters(base, stepM, rings) {
-  // small grid: (2*rings+1)^2
-  const out = [];
-  for (let dx = -rings; dx <= rings; dx++) {
-    for (let dy = -rings; dy <= rings; dy++) {
-      out.push({ xE: dx*stepM, yN: dy*stepM, center: shiftCenter(base, dx*stepM, dy*stepM) });
-    }
-  }
-  return out;
-}
+async function evaluateCandidate({ origin, center, strokesMeters, angleRad, anchorCount }) {
+  // Returns: score + segments + steps + overlays
+  // Build:
+  // - ideal overlay (orange dashed) from center
+  // - shape routes (green) by routing via anchors along each stroke
+  // - connectors (gray) between strokes + back to origin
 
-async function evaluateCandidate(baseOrigin, center, strokesMeters, anglesDeg, matchPts, idealPts) {
-  // Return best rotation for this center with score + segments
-  let best = null;
+  const idealStrokesLatLng = [];
+  const shapeSegs = [];
+  const connectorSegs = [];
+  const fullSegs = [];
+  const allSteps = [];
 
-  for (const deg of anglesDeg) {
-    const ang = deg * Math.PI / 180;
+  let current = origin;
 
-    const idealStrokesLatLng = [];
-    const matchedStrokesLatLng = [];
-    const connectorSegs = [];
-    const fullSegs = [];
-    let totalSimilarity = 0;
-    let totalMatchedMeters = 0;
+  let similaritySum = 0;
+  let totalShapeMeters = 0;
 
-    let current = baseOrigin;
+  for (const stroke of strokesMeters) {
+    // rotate and create ideal dense polyline for scoring/overlay
+    const rotated = rotatePts(stroke, angleRad);
 
-    // Each stroke: rotate -> sample -> match -> score
-    for (const stroke of strokesMeters) {
-      const rotated = rotatePts(stroke, ang);
+    const idealDenseM = resample(rotated, Math.max(60, anchorCount * 2));
+    const idealDenseLL = idealDenseM.map(([x,y]) => offsetToLatLng(center[0], center[1], x, y));
+    idealStrokesLatLng.push(idealDenseLL);
 
-      const idealDense = resample(rotated, idealPts).map(([x,y]) => offsetToLatLng(center[0], center[1], x, y));
-      const trace = resample(rotated, matchPts).map(([x,y]) => offsetToLatLng(center[0], center[1], x, y));
+    // anchors for OSRM route (forces the stroke)
+    const anchorsM = resample(rotated, anchorCount);
+    const anchorsLL = anchorsM.map(([x,y]) => offsetToLatLng(center[0], center[1], x, y));
 
-      let match;
-      try {
-        match = await osrmMatchFoot(trace); // snaps the stroke to roads :contentReference[oaicite:2]{index=2}
-      } catch {
-        return null; // this center/angle is not feasible
-      }
+    // connector current -> stroke start
+    const strokeStart = anchorsLL[0];
+    const conn1 = await osrmRoute([current, strokeStart]);
+    const connLL = geoToLatLngs(conn1.geometry);
+    connectorSegs.push(connLL);
+    fullSegs.push(connLL);
+    conn1.legs.forEach(leg => leg.steps.forEach(st => allSteps.push(st.maneuver.instruction)));
 
-      const snapped = geoToLatLngs(match.geometry);
-      idealStrokesLatLng.push(idealDense);
-      matchedStrokesLatLng.push(snapped);
+    // stroke route through via anchors
+    const strokeRoute = await osrmRoute(anchorsLL);
+    const strokeLL = geoToLatLngs(strokeRoute.geometry);
+    shapeSegs.push(strokeLL);
+    fullSegs.push(strokeLL);
 
-      // connector from current -> stroke start
-      const start = snapped[0];
-      const conn = await osrmRouteFoot(current, start);
-      const connLatLngs = geoToLatLngs(conn.geometry);
-      connectorSegs.push(connLatLngs);
-      fullSegs.push(connLatLngs);
-      fullSegs.push(snapped);
+    totalShapeMeters += (strokeRoute.distance || 0);
+    similaritySum += meanDistance(idealDenseLL, strokeLL);
 
-      // similarity
-      totalSimilarity += meanDistance(idealDense, snapped);
+    strokeRoute.legs.forEach(leg => leg.steps.forEach(st => allSteps.push(st.maneuver.instruction)));
 
-      // matched length in meters from OSRM
-      totalMatchedMeters += match.distance || 0;
-
-      current = snapped[snapped.length - 1];
-
-      // be nice to demo server: tiny pause if doing many calls
-      await sleep(40);
-    }
-
-    // back to origin connector
-    const back = await osrmRouteFoot(current, baseOrigin);
-    const backLatLngs = geoToLatLngs(back.geometry);
-    connectorSegs.push(backLatLngs);
-    fullSegs.push(backLatLngs);
-
-    const avgSimilarity = totalSimilarity / strokesMeters.length;
-
-    // Objective: shape similarity dominates, but also keep distance near target.
-    const result = {
-      center, deg,
-      avgSimilarity,
-      matchedMeters: totalMatchedMeters,
-      idealStrokesLatLng,
-      matchedStrokesLatLng,
-      connectorSegs,
-      fullSegs
-    };
-
-    if (!best || result.avgSimilarity < best.avgSimilarity) best = result;
+    current = strokeLL[strokeLL.length - 1];
   }
 
-  return best;
+  // connector back to origin
+  const connBack = await osrmRoute([current, origin]);
+  const backLL = geoToLatLngs(connBack.geometry);
+  connectorSegs.push(backLL);
+  fullSegs.push(backLL);
+  connBack.legs.forEach(leg => leg.steps.forEach(st => allSteps.push(st.maneuver.instruction)));
+
+  const avgSimilarity = similaritySum / strokesMeters.length;
+
+  // score: similarity dominates; lightly penalize huge connector distance
+  const connMeters = (connBack.distance || 0); // partial; acceptable
+  const score = avgSimilarity * (1 + Math.min(0.35, connMeters / 5000));
+
+  return {
+    score,
+    idealStrokesLatLng,
+    shapeSegs,
+    connectorSegs,
+    fullSegs,
+    allSteps,
+    totalShapeMeters
+  };
 }
 
+// ---------- main build ----------
 async function buildRoute() {
   try {
     setStatus("Getting location…");
+    clearSteps();
+
     const miles = Number($("miles").value || 0);
     if (!Number.isFinite(miles) || miles <= 0) throw new Error("Enter miles > 0");
 
-    const targetMeters = milesToMeters(miles);
+    const effort = $("effort").value;
     const origin = await getLocation();
 
     if (!map) {
@@ -279,83 +358,115 @@ async function buildRoute() {
     }
 
     clearLayers();
-    $("steps").innerHTML = "";
 
-    // strokes in meter space scaled to distance
+    // 1) Detect dominant street bearing (one Overpass call)
+    setStatus("Analyzing nearby street grid…");
+    let domDeg = 0;
+    try {
+      domDeg = await getDominantBearing(origin, 900);
+    } catch {
+      domDeg = 0; // fallback
+    }
+
+    // 2) Choose 2 candidate rotations: grid-aligned + perpendicular
+    // For letters, aligning to grid matters most.
+    const angles = [];
+    angles.push(domDeg);
+    angles.push((domDeg + 90) % 180);
+
+    // Convert to radians
+    const angleRads = angles.map(d => d * Math.PI/180);
+
+    // 3) Candidate centers near you
+    const centers = candidateCenters(origin, effort);
+
+    // 4) Build strokes and scale to target miles
+    const targetMeters = milesToMeters(miles);
     let strokes = getStrokes(selectedShape);
     strokes = scaleStrokes(strokes, targetMeters);
 
-    // search parameters (kept modest to avoid demo abuse) :contentReference[oaicite:3]{index=3}
-    const anglesDeg = (selectedShape === "hi")
-      ? [0,15,30,45,60,75,90,105,120,135,150,165]
-      : [0,30,60,90,120,150];
+    // 5) Anchor count: “hi” needs more forcing
+    // Keep anchors modest for speed.
+    const anchorCount =
+      selectedShape === "hi"
+        ? (effort === "lite" ? 14 : effort === "max" ? 22 : 18)
+        : (effort === "lite" ? 12 : effort === "max" ? 18 : 15);
 
-    // center shifts: try a 3x3 grid (rings=1) at 250m spacing
-    // increase rings to 2 for more search if needed (but more OSRM calls)
-    const centers = candidateCenters(origin, 250, 1);
+    setStatus("Searching placement + orientation (fast)…");
 
-    // sampling counts
-    const matchPts = 35;  // keep < ~100 to avoid TooBig on match :contentReference[oaicite:4]{index=4}
-    const idealPts = 70;
+    let best = null;
+    let tried = 0;
 
-    setStatus("Searching nearby placements/orientations…");
+    for (let ci = 0; ci < centers.length; ci++) {
+      for (let ai = 0; ai < angleRads.length; ai++) {
+        tried++;
+        setStatus(`Trying ${tried}/${centers.length * angleRads.length}…`);
 
-    let bestOverall = null;
-    for (let i = 0; i < centers.length; i++) {
-      const c = centers[i].center;
-      setStatus(`Testing placement ${i+1}/${centers.length}…`);
+        const center = centers[ci].center;
+        const angleRad = angleRads[ai];
 
-      const bestAtCenter = await evaluateCandidate(origin, c, strokes, anglesDeg, matchPts, idealPts);
-      if (!bestAtCenter) continue;
+        try {
+          const result = await evaluateCandidate({
+            origin,
+            center,
+            strokesMeters: strokes,
+            angleRad,
+            anchorCount
+          });
 
-      // Incorporate distance error lightly
-      const distanceError = Math.abs(bestAtCenter.matchedMeters - targetMeters) / targetMeters;
-      const score = bestAtCenter.avgSimilarity * (1 + 0.35 * distanceError);
-
-      if (!bestOverall || score < bestOverall.score) {
-        bestOverall = { ...bestAtCenter, score };
+          if (!best || result.score < best.score) {
+            best = { ...result, center, angleRad, domDeg };
+          }
+        } catch {
+          // candidate failed; skip
+        }
       }
     }
 
-    if (!bestOverall) {
-      throw new Error("Couldn’t fit this figure nearby. Try more miles, or move to a more grid-like area.");
+    if (!best) {
+      throw new Error("Couldn’t fit the figure here. Try increasing miles or move to a more grid-like area.");
     }
 
-    // Draw layers
+    // 6) Draw layers
     idealLayer = L.layerGroup(
-      bestOverall.idealStrokesLatLng.map(st =>
+      best.idealStrokesLatLng.map(st =>
         L.polyline(st, { color: "#f97316", weight: 3, dashArray: "6 8", opacity: 0.85 })
       )
     ).addTo(map);
 
     fullLayer = L.layerGroup(
-      bestOverall.fullSegs.map(seg =>
+      best.fullSegs.map(seg =>
         L.polyline(seg, { color: "#60a5fa", weight: 6, opacity: 0.45 })
       )
     ).addTo(map);
 
     connectorLayer = L.layerGroup(
-      bestOverall.connectorSegs.map(seg =>
+      best.connectorSegs.map(seg =>
         L.polyline(seg, { color: "#d4d4d8", weight: 3, opacity: 0.30 })
       )
     ).addTo(map);
 
     shapeLayer = L.layerGroup(
-      bestOverall.matchedStrokesLatLng.map(seg =>
+      best.shapeSegs.map(seg =>
         L.polyline(seg, { color: "#22c55e", weight: 8, opacity: 1.0 })
       )
     ).addTo(map);
 
     map.fitBounds(shapeLayer.getBounds(), { padding: [20, 20] });
 
-    setStatus(`Ready ✅ (shifted center + rotated ${bestOverall.deg}° for best fit)`);
+    // steps
+    best.allSteps.slice(0, 120).forEach((s, i) => addStep(`${i+1}. ${s}`));
+    if (best.allSteps.length > 120) addStep(`(Showing first 120 steps of ${best.allSteps.length}.)`);
+
+    const usedDeg = (best.angleRad * 180/Math.PI).toFixed(0);
+    setStatus(`Ready ✅ (Used ~${usedDeg}°; grid≈${domDeg.toFixed(0)}°; anchors=${anchorCount})`);
   } catch (e) {
     console.error(e);
     setStatus(e.message || String(e));
   }
 }
 
-// UI
+// ---------- UI wiring ----------
 $("shapes").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-shape]");
   if (!btn) return;
@@ -365,3 +476,6 @@ $("shapes").addEventListener("click", (e) => {
 });
 
 $("build").addEventListener("click", buildRoute);
+
+// Default selection
+selectedShape = "hi";
