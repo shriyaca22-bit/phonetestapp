@@ -1,49 +1,79 @@
-console.log("new version")
 const $ = (id) => document.getElementById(id);
 
-let selectedShape = "square";
+let selectedShape = "hi";
 let map;
 
-// Leaflet layers
-let routeLayer = null;       // full route (connectors + shape)
-let shapeLayer = null;       // on-road “shape” segments only
-let connectorLayer = null;   // on-road connectors only
-let idealLayer = null;       // dashed “ideal” drawing
+// Layers
+let idealLayer, shapeLayer, connectorLayer, fullLayer;
 
+const OSRM = "https://router.project-osrm.org";
+
+// ---------- Utilities ----------
 const milesToMeters = (mi) => mi * 1609.34;
 
-// -------- Geometry helpers (in meters space) --------
-function dist2(a, b) {
-  const dx = a[0] - b[0];
-  const dy = a[1] - b[1];
-  return Math.hypot(dx, dy);
+function setStatus(msg) { $("status").textContent = msg; }
+
+async function getLocation() {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve([p.coords.latitude, p.coords.longitude]),
+      reject,
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
+    );
+  });
 }
 
-function polylineLength(pts) {
+// meters (east, north) -> [lat,lng]
+function offsetToLatLng(originLat, originLng, xE, yN) {
+  const metersPerDegLat = 111320;
+  const metersPerDegLng = 111320 * Math.cos((originLat * Math.PI) / 180);
+  return [
+    originLat + (yN / metersPerDegLat),
+    originLng + (xE / metersPerDegLng)
+  ];
+}
+
+function rotatePts(pts, angleRad) {
+  const c = Math.cos(angleRad), s = Math.sin(angleRad);
+  return pts.map(([x,y]) => [x*c - y*s, x*s + y*c]);
+}
+
+function polyLen(pts) {
   let sum = 0;
-  for (let i = 1; i < pts.length; i++) sum += dist2(pts[i - 1], pts[i]);
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i][0] - pts[i-1][0];
+    const dy = pts[i][1] - pts[i-1][1];
+    sum += Math.hypot(dx, dy);
+  }
   return sum;
 }
 
-function resamplePolyline(pts, n) {
-  // Return ~n points equally spaced along the polyline length
+function scaleStrokes(strokes, targetMeters) {
+  const total = strokes.reduce((acc, st) => acc + polyLen(st), 0);
+  const k = targetMeters / Math.max(total, 1e-9);
+  return strokes.map(st => st.map(([x,y]) => [x*k, y*k]));
+}
+
+// resample to N evenly-spaced points along polyline
+function resample(pts, N) {
   if (pts.length < 2) return pts;
-  const total = polylineLength(pts);
-  if (total <= 1e-9) return pts;
+  const total = polyLen(pts);
+  if (total < 1e-9) return pts;
 
-  const targetStep = total / (n - 1);
+  const step = total / (N - 1);
   const out = [pts[0].slice()];
-  let carried = 0;
+
   let i = 1;
-  let prev = pts[0];
+  let prev = pts[0].slice();
+  let carried = 0;
 
-  while (out.length < n && i < pts.length) {
+  while (out.length < N && i < pts.length) {
     const cur = pts[i];
-    const segLen = dist2(prev, cur);
+    const seg = Math.hypot(cur[0]-prev[0], cur[1]-prev[1]);
 
-    if (carried + segLen >= targetStep) {
-      const remain = targetStep - carried;
-      const t = remain / segLen;
+    if (carried + seg >= step) {
+      const need = step - carried;
+      const t = need / seg;
       const nx = prev[0] + t * (cur[0] - prev[0]);
       const ny = prev[1] + t * (cur[1] - prev[1]);
       const np = [nx, ny];
@@ -51,289 +81,248 @@ function resamplePolyline(pts, n) {
       prev = np;
       carried = 0;
     } else {
-      carried += segLen;
+      carried += seg;
       prev = cur;
       i++;
     }
   }
 
-  if (out.length < n) out.push(pts[pts.length - 1].slice());
+  if (out.length < N) out.push(pts[pts.length - 1].slice());
   return out;
 }
 
-function scaleStrokesToDistance(strokes, targetMeters) {
-  // Scale all strokes together so total drawn length ~ targetMeters
-  const totalLen = strokes.reduce((acc, s) => acc + polylineLength(s), 0);
-  const scale = targetMeters / Math.max(totalLen, 1e-9);
-  return strokes.map(st => st.map(([x, y]) => [x * scale, y * scale]));
+// distance from point to polyline (latlng space)
+function pointToSegmentDist(p, a, b) {
+  const px = p[0], py = p[1];
+  const ax = a[0], ay = a[1];
+  const bx = b[0], by = b[1];
+  const vx = bx-ax, vy = by-ay;
+  const wx = px-ax, wy = py-ay;
+  const c1 = vx*wx + vy*wy;
+  if (c1 <= 0) return Math.hypot(px-ax, py-ay);
+  const c2 = vx*vx + vy*vy;
+  if (c2 <= c1) return Math.hypot(px-bx, py-by);
+  const t = c1 / c2;
+  const proj = [ax + t*vx, ay + t*vy];
+  return Math.hypot(px-proj[0], py-proj[1]);
 }
 
-// Convert local meters offsets (x east, y north) -> latlng near origin
-function offsetToLatLng(originLat, originLng, xMetersEast, yMetersNorth) {
-  const metersPerDegLat = 111320;
-  const metersPerDegLng = 111320 * Math.cos((originLat * Math.PI) / 180);
-
-  return [
-    originLat + (yMetersNorth / metersPerDegLat),
-    originLng + (xMetersEast / metersPerDegLng)
-  ];
+function meanDistance(idealPts, snappedPts) {
+  // crude but effective: average distance from each ideal point to snapped polyline
+  if (snappedPts.length < 2) return 1e9;
+  let sum = 0;
+  for (const p of idealPts) {
+    let best = Infinity;
+    for (let i = 1; i < snappedPts.length; i++) {
+      best = Math.min(best, pointToSegmentDist(p, snappedPts[i-1], snappedPts[i]));
+    }
+    sum += best;
+  }
+  return sum / idealPts.length;
 }
 
-async function getLocation() {
-  return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) return reject(new Error("Geolocation not supported."));
-    navigator.geolocation.getCurrentPosition(
-      (pos) => resolve([pos.coords.latitude, pos.coords.longitude]),
-      (err) => reject(err),
-      { enableHighAccuracy: true, timeout: 15000, maximumAge: 3000 }
-    );
-  });
-}
-
-// -------- Shape definition as STROKES --------
-// Each stroke is a polyline in normalized meter space.
-// For square/heart: one stroke.
-// For "hi": multiple strokes. Connectors between strokes are NOT part of the shape.
+// ---------- Shape strokes (meter space, normalized) ----------
 function getStrokes(shape) {
   if (shape === "square") {
-    return [
-      [
-        [-0.5, -0.5],
-        [ 0.5, -0.5],
-        [ 0.5,  0.5],
-        [-0.5,  0.5],
-        [-0.5, -0.5]
-      ]
-    ];
+    return [[
+      [-0.6,-0.6],[0.6,-0.6],[0.6,0.6],[-0.6,0.6],[-0.6,-0.6]
+    ]];
   }
 
   if (shape === "heart") {
     const pts = [];
-    const n = 120;
+    const n = 140;
     for (let i = 0; i <= n; i++) {
-      const t = (i / n) * 2 * Math.PI;
-      const x = 16 * Math.pow(Math.sin(t), 3);
-      const y =
-        13 * Math.cos(t) -
-        5 * Math.cos(2 * t) -
-        2 * Math.cos(3 * t) -
-        Math.cos(4 * t);
-      pts.push([x / 18, y / 18]);
+      const t = (i/n) * 2*Math.PI;
+      const x = 16*Math.pow(Math.sin(t),3) / 18;
+      const y = (13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t)) / 18;
+      pts.push([x,y]);
     }
     pts.push(pts[0]);
     return [pts];
   }
 
-  // "hi" as strokes:
-  // h: left vertical, cross, right vertical
+  // “hi” = 3 strokes (h, i-stem, dot)
   const h = [
-    [-1.3, -0.8],
-    [-1.3,  0.9],
-    [-1.3,  0.1],
-    [-0.7,  0.1],
-    [-0.7,  0.9],
-    [-0.7, -0.8]
+    [-1.4,-0.8],[-1.4,0.9],[-1.4,0.1],[-0.8,0.1],[-0.8,0.9],[-0.8,-0.8]
   ];
-
-  // i stem
-  const iStem = [
-    [0.4, -0.8],
-    [0.4,  0.9]
-  ];
-
-  // dot as a tiny loop stroke
-  const dot = [
-    [0.4, 1.15],
-    [0.48, 1.15],
-    [0.48, 1.07],
-    [0.4, 1.07],
-    [0.4, 1.15]
-  ];
-
+  const iStem = [[0.5,-0.8],[0.5,0.9]];
+  const dot = [[0.45,1.15],[0.55,1.15],[0.55,1.05],[0.45,1.05],[0.45,1.15]];
   return [h, iStem, dot];
 }
 
-// -------- OSRM routing --------
-// We route each piece separately and then draw as separate layers (shape vs connector).
-// OSRM endpoint: router.project-osrm.org
-async function osrmRouteFoot(latlngs, steps = true) {
-  // latlngs: [[lat,lng], ...] (must be 2+)
-  const coords = latlngs.map(([lat, lng]) => `${lng},${lat}`).join(";");
-  const url =
-    `https://router.project-osrm.org/route/v1/foot/${coords}` +
-    `?overview=full&geometries=geojson&steps=${steps ? "true" : "false"}`;
-
+// ---------- OSRM calls ----------
+async function osrmMatchFoot(latlngs) {
+  // OSRM expects lon,lat pairs
+  const coords = latlngs.map(([lat,lng]) => `${lng},${lat}`).join(";");
+  const url = `${OSRM}/match/v1/foot/${coords}?geometries=geojson&overview=full&steps=true`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`OSRM request failed (${res.status})`);
   const data = await res.json();
-  if (!data.routes?.length) throw new Error("No route found in this area.");
+  if (!res.ok || data.code !== "Ok") throw new Error(data.message || "OSRM match failed");
+  // Take the best matching
+  const m = data.matchings?.[0];
+  if (!m?.geometry) throw new Error("No matching geometry returned");
+  return m;
+}
+
+async function osrmRouteFoot(a, b) {
+  const coords = `${a[1]},${a[0]};${b[1]},${b[0]}`;
+  const url = `${OSRM}/route/v1/foot/${coords}?geometries=geojson&overview=full&steps=true`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok || data.code !== "Ok") throw new Error(data.message || "OSRM route failed");
   return data.routes[0];
 }
 
-function geojsonToLatLngs(geojsonLine) {
-  // geojsonLine.coordinates is [lng,lat]
-  return geojsonLine.coordinates.map(([lng, lat]) => [lat, lng]);
+function geojsonToLatLngs(geo) {
+  return geo.coordinates.map(([lng,lat]) => [lat,lng]);
 }
 
 function clearLayers() {
-  [routeLayer, shapeLayer, connectorLayer, idealLayer].forEach(l => {
-    if (l) l.remove();
-  });
-  routeLayer = shapeLayer = connectorLayer = idealLayer = null;
+  [idealLayer, shapeLayer, connectorLayer, fullLayer].forEach(l => l && l.remove());
+  idealLayer = shapeLayer = connectorLayer = fullLayer = null;
 }
 
-function setStatus(msg) {
-  $("status").textContent = msg;
-}
-
-function renderSteps(allSteps) {
-  const root = $("steps");
-  root.innerHTML = "";
-  allSteps.forEach((s, idx) => {
-    const div = document.createElement("div");
-    div.className = "step";
-    div.innerHTML = `<div><strong>Step ${idx + 1}</strong> · <span style="opacity:.7">${s.distance}</span></div>
-                     <div style="margin-top:6px">${s.instruction}</div>`;
-    root.appendChild(div);
-  });
-}
-
-// -------- Build route with “shape segments” and “connectors” --------
+// ---------- Main build ----------
 async function buildRoute() {
   try {
-    setStatus("Getting your location…");
+    setStatus("Getting location…");
     const miles = Number($("miles").value || 0);
-    if (!Number.isFinite(miles) || miles <= 0) throw new Error("Enter a valid miles value.");
+    if (!Number.isFinite(miles) || miles <= 0) throw new Error("Enter miles > 0");
 
-    const [lat, lng] = await getLocation();
+    const targetMeters = milesToMeters(miles);
+    const [olat, olng] = await getLocation();
 
     if (!map) {
-      map = L.map("map").setView([lat, lng], 15);
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19
-      }).addTo(map);
+      map = L.map("map").setView([olat, olng], 15);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
     }
-
     clearLayers();
     $("steps").innerHTML = "";
 
-    // 1) Build ideal strokes in meters, scale to target distance
-    const targetMeters = milesToMeters(miles);
+    // Build strokes scaled to distance
     let strokes = getStrokes(selectedShape);
-    strokes = scaleStrokesToDistance(strokes, targetMeters);
+    strokes = scaleStrokes(strokes, targetMeters);
 
-    // 2) Create "ideal dashed outline" (not road-snapped)
-    const idealLatLngStrokes = strokes.map(st =>
-      st.map(([x, y]) => offsetToLatLng(lat, lng, x, y))
-    );
+    // Rotate search (critical for letters)
+    const anglesDeg = selectedShape === "hi"
+      ? [0,15,30,45,60,75,90,105,120,135,150,165]
+      : [0,30,60,90,120,150];
 
-    idealLayer = L.layerGroup(
-      idealLatLngStrokes.map(st =>
-        L.polyline(st, { color: "#f97316", weight: 4, dashArray: "6 8", opacity: 0.9 })
-      )
-    ).addTo(map);
+    setStatus("Finding best orientation…");
 
-    // 3) Create anchor points for routing:
-    //    More anchors => better resemblance, but too many = slower/more requests.
-    const ANCHORS_PER_STROKE = 18;
-
-    const strokeAnchors = strokes.map(st => resamplePolyline(st, ANCHORS_PER_STROKE))
-      .map(st => st.map(([x, y]) => offsetToLatLng(lat, lng, x, y)));
-
-    // 4) Plan pieces:
-    //    - connector: origin -> start of stroke 1
-    //    - shape: each stroke routed through its anchors
-    //    - connector: end stroke k -> start stroke k+1
-    //    - connector: end last stroke -> origin
-    const origin = [lat, lng];
-
-    const pieces = [];
-
-    // connector to first stroke
-    pieces.push({ kind: "connector", from: origin, toPolyline: [origin, strokeAnchors[0][0]] });
-
-    // each stroke as a "shape" piece
-    for (let i = 0; i < strokeAnchors.length; i++) {
-      pieces.push({ kind: "shape", from: strokeAnchors[i][0], toPolyline: strokeAnchors[i] });
-
-      // connector to next stroke start (if exists)
-      if (i < strokeAnchors.length - 1) {
-        const end = strokeAnchors[i][strokeAnchors[i].length - 1];
-        const nextStart = strokeAnchors[i + 1][0];
-        pieces.push({ kind: "connector", from: end, toPolyline: [end, nextStart] });
-      }
-    }
-
-    // connector back to origin
-    {
-      const lastStroke = strokeAnchors[strokeAnchors.length - 1];
-      const end = lastStroke[lastStroke.length - 1];
-      pieces.push({ kind: "connector", from: end, toPolyline: [end, origin] });
-    }
-
-    setStatus("Routing on roads… (this may take a few seconds)");
-
-    // 5) Route each piece with OSRM and collect:
-    const fullLatLngs = [];
-    const shapeLatLngs = [];
-    const connectorLatLngs = [];
+    // For each stroke, pick best rotation independently (works well for letters)
+    const chosen = [];
+    const allIdealLatLngStrokes = [];
+    const allMatchedLatLngStrokes = [];
+    const allConnectorLatLngs = [];
+    const allFullLatLngs = [];
     const allSteps = [];
 
-    for (const piece of pieces) {
-      // For a shape piece, we route through many anchors to “force” the geometry.
-      // OSRM supports multiple coords in one route request.
-      const route = await osrmRouteFoot(piece.toPolyline, true);
+    let currentPos = [olat, olng];
 
-      const line = geojsonToLatLngs(route.geometry);
+    for (let si = 0; si < strokes.length; si++) {
+      const stroke = strokes[si];
 
-      // Append without duplicating the joint point
-      if (fullLatLngs.length > 0 && line.length > 0) line.shift();
-      fullLatLngs.push(...line);
+      let best = { score: Infinity, angle: 0, idealLatLngs: null, matchedLatLngs: null, matchObj: null };
 
-      if (piece.kind === "shape") {
-        shapeLatLngs.push(line);
-      } else {
-        connectorLatLngs.push(line);
+      for (const deg of anglesDeg) {
+        const rad = (deg * Math.PI) / 180;
+        const rotated = rotatePts(stroke, rad);
+
+        // Ideal latlngs (for scoring + dashed overlay)
+        // Use ~60 points for overlay; use fewer for match due to OSRM limits.
+        const idealDense = resample(rotated, 60).map(([x,y]) => offsetToLatLng(olat, olng, x, y));
+        const idealForMatch = resample(rotated, 40).map(([x,y]) => offsetToLatLng(olat, olng, x, y));
+
+        // OSRM match can fail if too many points; we keep it conservative.
+        let match;
+        try {
+          match = await osrmMatchFoot(idealForMatch);
+        } catch {
+          continue;
+        }
+
+        const snapped = geojsonToLatLngs(match.geometry);
+        const score = meanDistance(idealDense, snapped);
+
+        if (score < best.score) {
+          best = { score, angle: deg, idealLatLngs: idealDense, matchedLatLngs: snapped, matchObj: match };
+        }
       }
 
-      // Collect turn steps (for MVP we just concatenate; you could later label “connector vs shape”)
-      route.legs.forEach(leg => {
-        leg.steps.forEach(st => {
-          allSteps.push({
-            instruction: st.maneuver.instruction,
-            distance: st.distance?.toFixed ? `${Math.round(st.distance)} m` : ""
-          });
-        });
-      });
+      if (!best.idealLatLngs) throw new Error("Couldn’t match the shape to roads here. Try more miles or move location.");
+
+      // Connector from currentPos to start of matched stroke (gray)
+      const start = best.matchedLatLngs[0];
+      const conn = await osrmRouteFoot(currentPos, start);
+      const connLatLngs = geojsonToLatLngs(conn.geometry);
+
+      allConnectorLatLngs.push(connLatLngs);
+      allFullLatLngs.push(connLatLngs);
+
+      conn.legs.forEach(leg => leg.steps.forEach(st => allSteps.push(st.maneuver.instruction)));
+
+      // Stroke itself (green)
+      allIdealLatLngStrokes.push(best.idealLatLngs);
+      allMatchedLatLngStrokes.push(best.matchedLatLngs);
+      allFullLatLngs.push(best.matchedLatLngs);
+
+      // Steps from match: OSRM match returns legs like route objects in practice; if missing, we just show route steps.
+      best.matchObj.legs?.forEach(leg => leg.steps?.forEach(st => allSteps.push(st.maneuver.instruction)));
+
+      currentPos = best.matchedLatLngs[best.matchedLatLngs.length - 1];
+      chosen.push(best);
     }
 
-    // 6) Draw layers:
-    // Full route (base)
-    routeLayer = L.polyline(fullLatLngs, { color: "#60a5fa", weight: 6, opacity: 0.75 }).addTo(map);
+    // Connector back to origin (gray)
+    const back = await osrmRouteFoot(currentPos, [olat, olng]);
+    const backLatLngs = geojsonToLatLngs(back.geometry);
+    allConnectorLatLngs.push(backLatLngs);
+    allFullLatLngs.push(backLatLngs);
+    back.legs.forEach(leg => leg.steps.forEach(st => allSteps.push(st.maneuver.instruction)));
 
-    // Connector segments (distinct)
+    // Draw: ideal dashed (orange)
+    idealLayer = L.layerGroup(
+      allIdealLatLngStrokes.map(st => L.polyline(st, { color: "#f97316", weight: 3, dashArray: "6 8", opacity: 0.85 }))
+    ).addTo(map);
+
+    // Full route base (blue)
+    fullLayer = L.layerGroup(
+      allFullLatLngs.map(seg => L.polyline(seg, { color: "#60a5fa", weight: 6, opacity: 0.55 }))
+    ).addTo(map);
+
+    // Connectors (gray, thin)
     connectorLayer = L.layerGroup(
-      connectorLatLngs.map(seg => L.polyline(seg, { color: "#a3a3a3", weight: 6, opacity: 0.85 }))
+      allConnectorLatLngs.map(seg => L.polyline(seg, { color: "#d4d4d8", weight: 3, opacity: 0.35 }))
     ).addTo(map);
 
-    // Shape segments highlighted on top
+    // Shape strokes snapped (green, thick)
     shapeLayer = L.layerGroup(
-      shapeLatLngs.map(seg => L.polyline(seg, { color: "#22c55e", weight: 7, opacity: 0.95 }))
+      allMatchedLatLngStrokes.map(seg => L.polyline(seg, { color: "#22c55e", weight: 8, opacity: 1.0 }))
     ).addTo(map);
 
-    map.fitBounds(routeLayer.getBounds(), { padding: [20, 20] });
+    // Fit bounds
+    const bounds = shapeLayer.getBounds();
+    map.fitBounds(bounds, { padding: [20, 20] });
 
-    // 7) Render turn-by-turn
-    renderSteps(allSteps);
+    // Render instructions
+    const root = $("steps");
+    allSteps.forEach((txt, i) => {
+      const d = document.createElement("div");
+      d.className = "step";
+      d.textContent = `${i + 1}. ${txt}`;
+      root.appendChild(d);
+    });
 
-    setStatus("Route ready ✅  (Green = drawing, Gray = connector, Orange dashed = ideal shape)");
-  } catch (err) {
-    console.error(err);
-    setStatus(err?.message || String(err));
+    setStatus("Ready ✅ Green=drawing, Gray=connector, Orange dashed=ideal.");
+  } catch (e) {
+    console.error(e);
+    setStatus(e.message || String(e));
   }
 }
 
-// -------- UI wiring --------
+// UI
 $("shapes").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-shape]");
   if (!btn) return;
