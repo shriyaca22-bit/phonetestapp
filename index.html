@@ -1,71 +1,62 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#111111" />
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#111111" />
 
-    <!-- PWA -->
-    <link rel="manifest" href="manifest.webmanifest" />
-    <link rel="apple-touch-icon" href="icon-192.png" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Route Sketch Runner</title>
 
-    <title>Steps Demo</title>
-    <link rel="stylesheet" href="styles.css" />
-  </head>
-  <body>
-    <header>
-      <h1>Steps Demo</h1>
-      <p class="sub">Offline-friendly PWA (manual steps for now)</p>
-    </header>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
 
-    <main>
-      <section class="card">
-        <div class="row">
-          <div>
-            <h2>Today</h2>
-            <p class="big" id="todaySteps">—</p>
-          </div>
-          <div class="stat">
-            <div class="label">7-day avg</div>
-            <div class="value" id="avg7">—</div>
-          </div>
-          <div class="stat">
-            <div class="label">14-day total</div>
-            <div class="value" id="total14">—</div>
-          </div>
-        </div>
-      </section>
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
 
-      <section class="card">
-        <h2>Log steps</h2>
-        <form id="logForm" class="form">
-          <label>
-            Date
-            <input type="date" id="dateInput" required />
-          </label>
-          <label>
-            Steps
-            <input type="number" id="stepsInput" min="0" placeholder="e.g., 8400" required />
-          </label>
-          <button type="submit">Save</button>
-          <button type="button" id="seedBtn" class="secondary">Fill sample data</button>
-          <button type="button" id="clearBtn" class="secondary danger">Clear</button>
-        </form>
-        <p class="hint" id="status"></p>
-      </section>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header>
+  <h1>Route Sketch Runner</h1>
+  <p class="sub">Run a shape, not just a distance</p>
+</header>
 
-      <section class="card">
-        <h2>Last 14 days</h2>
-        <div id="list" class="list"></div>
-      </section>
-    </main>
+<main>
+  <section class="card">
+    <h2>Choose shape</h2>
+    <div class="pillRow" id="shapes">
+      <button class="pill selected" data-shape="square">Square</button>
+      <button class="pill" data-shape="heart">Heart</button>
+      <button class="pill" data-shape="hi">“hi”</button>
+    </div>
 
-    <footer>
-      <small>Tip: In Safari → Share → Add to Home Screen</small>
-    </footer>
+    <div class="grid">
+      <label>
+        Miles
+        <input id="miles" type="number" step="0.25" min="0.5" value="3" />
+      </label>
+      <button id="build">Build route</button>
+    </div>
 
-    <script src="app.js"></script>
-  </body>
+    <p id="status" class="hint"></p>
+  </section>
+
+  <section class="card">
+    <h2>Map</h2>
+    <div id="map"></div>
+  </section>
+
+  <section class="card">
+    <h2>Turn-by-turn</h2>
+    <div id="steps" class="steps"></div>
+  </section>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
 </html>
