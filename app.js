@@ -1,3 +1,4 @@
+console.log("new version")
 const $ = (id) => document.getElementById(id);
 
 let selectedShape = "square";
