@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#111111" />
+
+    <!-- PWA -->
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <title>Steps Demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Steps Demo</h1>
+      <p class="sub">Offline-friendly PWA (manual steps for now)</p>
+    </header>
+
+    <main>
+      <section class="card">
+        <div class="row">
+          <div>
+            <h2>Today</h2>
+            <p class="big" id="todaySteps">—</p>
+          </div>
+          <div class="stat">
+            <div class="label">7-day avg</div>
+            <div class="value" id="avg7">—</div>
+          </div>
+          <div class="stat">
+            <div class="label">14-day total</div>
+            <div class="value" id="total14">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Log steps</h2>
+        <form id="logForm" class="form">
+          <label>
+            Date
+            <input type="date" id="dateInput" required />
+          </label>
+          <label>
+            Steps
+            <input type="number" id="stepsInput" min="0" placeholder="e.g., 8400" required />
+          </label>
+          <button type="submit">Save</button>
+          <button type="button" id="seedBtn" class="secondary">Fill sample data</button>
+          <button type="button" id="clearBtn" class="secondary danger">Clear</button>
+        </form>
+        <p class="hint" id="status"></p>
+      </section>
+
+      <section class="card">
+        <h2>Last 14 days</h2>
+        <div id="list" class="list"></div>
+      </section>
+    </main>
+
+    <footer>
+      <small>Tip: In Safari → Share → Add to Home Screen</small>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
